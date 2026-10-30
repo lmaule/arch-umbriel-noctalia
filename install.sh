@@ -25,6 +25,11 @@ AUR_HELPER="${AUR_HELPER:-yay}"
 ENABLE_MULTILIB="${ENABLE_MULTILIB:-1}"
 ENABLE_GREETER="${ENABLE_GREETER:-1}"
 
+# Log everything so failures can be inspected afterwards.
+LOG_FILE="$HOME/umbriel-install.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "---- install.sh started $(date) ----"
+
 # ------------------------------------------------------------------------------
 # Helpers
 
@@ -36,27 +41,76 @@ pacman_install() {
     sudo pacman -S --needed --noconfirm "$@"
 }
 
+aur_has() {
+    curl -fsS "https://aur.archlinux.org/rpc/v5/info?arg%5B%5D=$1" 2>/dev/null | grep -q '"resultcount":1'
+}
+
 # Install the first package name that exists, preferring the official repos
 # over the AUR. Some of these projects are moving from the AUR into [extra],
 # so the exact name/location differs depending on when this is run.
+# Returns 0 on success, 1 if no candidate exists, 2 if the install/build failed.
 install_first_available() {
     local label="$1"; shift
     local pkg
     for pkg in "$@"; do
         if pacman -Si "$pkg" &>/dev/null; then
             info "Installing $label from the official repos ($pkg)"
-            pacman_install "$pkg"
-            return 0
+            pacman_install "$pkg" && return 0
+            warn "pacman failed to install $pkg"
+            return 2
         fi
     done
     for pkg in "$@"; do
-        if "$AUR_HELPER" -Si --aur "$pkg" &>/dev/null; then
+        if aur_has "$pkg"; then
             info "Installing $label from the AUR ($pkg)"
-            "$AUR_HELPER" -S --needed --noconfirm "$pkg"
-            return 0
+            "$AUR_HELPER" -S --needed --noconfirm "$pkg" && return 0
+            warn "$AUR_HELPER failed to build/install $pkg (see $LOG_FILE)"
+            return 2
         fi
     done
     return 1
+}
+
+# Last-resort fallback: build Umbriel from upstream source with Meson, exactly
+# as described in Umbriel's docs/user/installation.md, installing into /usr so
+# the greeter finds /usr/share/wayland-sessions/umbriel.desktop.
+build_umbriel_from_source() {
+    info "Building Umbriel from source (github.com/noctalia-dev/umbriel)"
+
+    # Umbriel needs wlroots 0.20.x specifically.
+    local wlr
+    for wlr in wlroots0.20 wlroots; do
+        if pacman -Si "$wlr" 2>/dev/null | grep -q '^Version *: 0\.20\.'; then
+            pacman_install "$wlr"; break
+        fi
+    done
+    if ! pkg-config --exists 'wlroots-0.20 >= 0.20.1' 2>/dev/null; then
+        aur_has wlroots0.20 && "$AUR_HELPER" -S --needed --noconfirm wlroots0.20 || true
+    fi
+    pkg-config --exists 'wlroots-0.20 >= 0.20.1' \
+        || { warn "wlroots 0.20.1+ is not available; cannot build Umbriel."; return 1; }
+
+    pacman_install meson ninja pkgconf gcc cmake \
+        wayland wayland-protocols libxkbcommon libinput libei pixman \
+        tomlplusplus nlohmann-json cairo pango libdrm libdisplay-info \
+        systemd-libs libxcb xcb-util-wm mesa lcms2 jemalloc || return 1
+
+    local src="$HOME/.cache/umbriel-src"
+    if [[ -d "$src/.git" ]]; then
+        git -C "$src" pull --ff-only || return 1
+    else
+        rm -rf "$src"
+        git clone --depth 1 https://github.com/noctalia-dev/umbriel.git "$src" || return 1
+    fi
+    (
+        cd "$src"
+        rm -rf build
+        meson setup build --buildtype=release --prefix=/usr -Dtests=disabled
+        meson compile -C build
+        sudo meson install -C build --no-rebuild
+    ) || return 1
+    sudo systemctl daemon-reload
+    warn "Umbriel was installed from source (not tracked by pacman). To update later: re-run this script, or uninstall with: sudo ninja -C $src/build uninstall"
 }
 
 # ------------------------------------------------------------------------------
@@ -161,21 +215,28 @@ fi
 # Umbriel, Noctalia, Noctalia Greeter, Helium
 
 # Umbriel is built from source (C++23 / wlroots 0.20); this takes a few minutes.
-install_first_available "Umbriel" umbriel umbriel-git \
-    || die "Could not find an Umbriel package (tried: umbriel, umbriel-git)."
+rc=0
+install_first_available "Umbriel" umbriel umbriel-git || rc=$?
+if [[ $rc -ne 0 ]] || ! command -v start-umbriel &>/dev/null; then
+    [[ $rc -eq 1 ]] && warn "No Umbriel package found in the repos or AUR (tried: umbriel, umbriel-git)."
+    warn "Umbriel package install did not succeed; falling back to a source build."
+    build_umbriel_from_source || die "Umbriel failed to install. The full output is in $LOG_FILE"
+fi
+command -v start-umbriel &>/dev/null || die "Umbriel installed but start-umbriel is missing. See $LOG_FILE"
+info "Umbriel installed: $(umbriel --version 2>/dev/null || echo ok)"
 
 install_first_available "xdg-desktop-portal-umbriel (screen sharing)" \
     xdg-desktop-portal-umbriel xdg-desktop-portal-umbriel-git \
     || warn "xdg-desktop-portal-umbriel not found; screen sharing will not work until it is installed."
 
 install_first_available "Noctalia" noctalia noctalia-git \
-    || die "Could not find a Noctalia package (tried: noctalia, noctalia-git)."
+    || die "Could not install Noctalia (tried: noctalia, noctalia-git)."
 
 install_first_available "Noctalia Greeter" noctalia-greeter noctalia-greeter-git \
-    || die "Could not find a Noctalia Greeter package (tried: noctalia-greeter, noctalia-greeter-git)."
+    || die "Could not install Noctalia Greeter (tried: noctalia-greeter, noctalia-greeter-git)."
 
 install_first_available "Helium browser" helium-browser-bin \
-    || die "Could not find helium-browser-bin in the AUR."
+    || die "Could not install helium-browser-bin from the AUR. See $LOG_FILE"
 
 # ------------------------------------------------------------------------------
 # User configuration

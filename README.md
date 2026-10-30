@@ -25,3 +25,7 @@ Mesa/RADV, 32-bit Vulkan via `[multilib]`) and installs:
 
 Options: `AUR_HELPER=paru`, `ENABLE_MULTILIB=0`, `ENABLE_GREETER=0`
 (e.g. `ENABLE_GREETER=0 ./install.sh`, then start from a TTY with `start-umbriel`).
+
+Everything the script prints is also saved to `~/umbriel-install.log`. The
+script is safe to re-run; if Umbriel can't be installed from a package, it
+falls back to building it from upstream source with Meson.
